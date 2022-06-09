@@ -22,6 +22,7 @@ package org.candlepin.subscriptions.subscription;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.dataformat.xml.XmlMapper;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import java.time.Duration;
@@ -55,6 +56,7 @@ import org.candlepin.subscriptions.subscription.api.model.Subscription;
 import org.candlepin.subscriptions.subscription.api.model.SubscriptionProduct;
 import org.candlepin.subscriptions.tally.UsageCalculation.Key;
 import org.candlepin.subscriptions.task.TaskQueueProperties;
+import org.candlepin.subscriptions.umb.CanonicalMessage;
 import org.candlepin.subscriptions.user.AccountService;
 import org.candlepin.subscriptions.util.ApplicationClock;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -70,6 +72,7 @@ import org.springframework.util.Assert;
 @Slf4j
 public class SubscriptionSyncController {
 
+  private static final XmlMapper umbMessageMapper = CanonicalMessage.createMapper();
   private SubscriptionRepository subscriptionRepository;
   private OrgConfigRepository orgRepository;
   private OfferingRepository offeringRepository;
@@ -130,14 +133,22 @@ public class SubscriptionSyncController {
   public void syncSubscription(
       Subscription subscription,
       Optional<org.candlepin.subscriptions.db.model.Subscription> subscriptionOptional) {
-    String sku = sku(subscription);
+    final org.candlepin.subscriptions.db.model.Subscription newOrUpdated = convertDto(subscription);
+    syncSubscription(newOrUpdated, subscriptionOptional);
+  }
+
+  @Transactional
+  public void syncSubscription(
+      org.candlepin.subscriptions.db.model.Subscription newOrUpdated,
+      Optional<org.candlepin.subscriptions.db.model.Subscription> subscriptionOptional) {
+    String sku = newOrUpdated.getSku();
 
     if (!productWhitelist.productIdMatches(sku)) {
       log.debug(
           "Sku {} not on allowlist, skipping subscription sync for subscriptionId: {} in org: {} ",
           sku,
-          subscription.getId(),
-          subscription.getWebCustomerId());
+          newOrUpdated.getSubscriptionId(),
+          newOrUpdated.getOwnerId());
       return;
     }
 
@@ -147,13 +158,15 @@ public class SubscriptionSyncController {
       log.debug(
           "Sku={} not in Offering repository, skipping subscription sync for subscriptionId={} in org={}",
           sku,
-          subscription.getId(),
-          subscription.getWebCustomerId());
+          newOrUpdated.getSubscriptionId(),
+          newOrUpdated.getOwnerId());
       return;
     }
 
-    log.debug("Syncing subscription from external service={}", subscription);
-    final org.candlepin.subscriptions.db.model.Subscription newOrUpdated = convertDto(subscription);
+    log.debug("Syncing subscription from external service={}", newOrUpdated);
+    // UMB doesn't provide all the fields, so if we have an existing DB record, we'll populate from
+    // that; otherwise, use the subscription service to fetch missing info
+    enrichMissingFields(newOrUpdated, subscriptionOptional);
     log.debug("New subscription that will need to be saved={}", newOrUpdated);
 
     checkForMissingBillingProvider(newOrUpdated);
@@ -174,17 +187,17 @@ public class SubscriptionSyncController {
                 .sku(existingSubscription.getSku())
                 .ownerId(existingSubscription.getOwnerId())
                 .accountNumber(existingSubscription.getAccountNumber())
-                .quantity(subscription.getQuantity())
+                .quantity(newOrUpdated.getQuantity())
                 .startDate(OffsetDateTime.now())
-                .endDate(clock.dateFromMilliseconds(subscription.getEffectiveEndDate()))
-                .billingProviderId(SubscriptionDtoUtil.extractBillingProviderId(subscription))
-                .billingAccountId(SubscriptionDtoUtil.extractBillingAccountId(subscription))
-                .subscriptionNumber(subscription.getSubscriptionNumber())
-                .billingProvider(SubscriptionDtoUtil.populateBillingProvider(subscription))
+                .endDate(newOrUpdated.getEndDate())
+                .billingProviderId(newOrUpdated.getBillingProviderId())
+                .billingAccountId(newOrUpdated.getBillingAccountId())
+                .subscriptionNumber(newOrUpdated.getSubscriptionNumber())
+                .billingProvider(newOrUpdated.getBillingProvider())
                 .build();
         subscriptionRepository.save(newSub);
       } else {
-        updateSubscription(subscription, existingSubscription);
+        updateSubscription(newOrUpdated, existingSubscription);
         subscriptionRepository.save(existingSubscription);
       }
       capacityReconciliationController.reconcileCapacityForSubscription(newOrUpdated);
@@ -209,6 +222,45 @@ public class SubscriptionSyncController {
         }
       }
     }
+  }
+
+  /**
+   * Populate a subscription entity with data from the DB if it exists, otherwise enrich with data
+   * from RH IT Subscription Service.
+   *
+   * @param subscription entity to populate with existing data
+   * @param optionalSubscription data from the DB, if present
+   */
+  private void enrichMissingFields(
+      org.candlepin.subscriptions.db.model.Subscription subscription,
+      Optional<org.candlepin.subscriptions.db.model.Subscription> optionalSubscription) {
+    if (subscription.getSubscriptionId() != null) {
+      // Subscription object already has needed data
+      return;
+    }
+    optionalSubscription
+        .or(() -> fetchSubscription(subscription.getSubscriptionNumber()))
+        .ifPresent(
+            existingData -> {
+              if (subscription.getSubscriptionId() == null) {
+                subscription.setSubscriptionId(existingData.getSubscriptionId());
+              }
+              if (subscription.getBillingAccountId() == null) {
+                subscription.setBillingAccountId(existingData.getBillingAccountId());
+              }
+              if (subscription.getBillingProvider() == null) {
+                subscription.setBillingProvider(existingData.getBillingProvider());
+              }
+              if (subscription.getBillingProviderId() == null) {
+                subscription.setBillingProviderId(existingData.getBillingProviderId());
+              }
+            });
+  }
+
+  private Optional<? extends org.candlepin.subscriptions.db.model.Subscription> fetchSubscription(
+      String subscriptionNumber) {
+    return Optional.of(
+        convertDto(subscriptionService.getSubscriptionBySubscriptionNumber(subscriptionNumber)));
   }
 
   @Transactional
@@ -324,26 +376,27 @@ public class SubscriptionSyncController {
         .build();
   }
 
-  protected void updateSubscription(
-      Subscription dto, org.candlepin.subscriptions.db.model.Subscription entity) {
-    if (dto.getEffectiveEndDate() != null) {
-      entity.setEndDate(clock.dateFromMilliseconds(dto.getEffectiveEndDate()));
-    }
+  private static org.candlepin.subscriptions.db.model.Subscription convertDto(
+      org.candlepin.subscriptions.umb.Subscription subscription) {
+    return org.candlepin.subscriptions.db.model.Subscription.builder()
+        // NOTE: UMB messages don't include subscriptionId
+        .subscriptionNumber(subscription.getSubscriptionNumber())
+        .sku(subscription.getSku())
+        .ownerId(subscription.getWebCustomerId())
+        .accountNumber(String.valueOf(subscription.getEbsAccountNumber()))
+        .quantity(subscription.getQuantity())
+        .startDate(subscription.getEffectiveStartDateInUtc())
+        .endDate(subscription.getEffectiveEndDateInUtc())
+        // NOTE: UMB messages don't include PAYG identifiers
+        .build();
   }
 
-  private String sku(Subscription subscription) {
-    return subscription.getSubscriptionProducts().stream()
-        .filter(
-            subscriptionProduct ->
-                Objects.isNull(subscriptionProduct.getParentSubscriptionProductId()))
-        .map(SubscriptionProduct::getSku)
-        .findFirst()
-        .orElseThrow(
-            () ->
-                new ExternalServiceException(
-                    ErrorCode.SUBSCRIPTION_SERVICE_REQUEST_ERROR,
-                    "Sku not present on subscription with id " + subscription.getId(),
-                    null));
+  protected void updateSubscription(
+      org.candlepin.subscriptions.db.model.Subscription newOrUpdated,
+      org.candlepin.subscriptions.db.model.Subscription entity) {
+    if (newOrUpdated.getEndDate() != null) {
+      entity.setEndDate(newOrUpdated.getEndDate());
+    }
   }
 
   public void saveSubscriptions(String subscriptionsJson, boolean reconcileCapacity) {
@@ -362,6 +415,24 @@ public class SubscriptionSyncController {
     } catch (JsonProcessingException e) {
       throw new IllegalArgumentException("Error parsing subscriptionsJson", e);
     }
+  }
+
+  @Transactional
+  public void saveUmbSubscriptionFromXml(String subscriptionXml) throws JsonProcessingException {
+    saveUmbSubscription(
+        umbMessageMapper
+            .readValue(subscriptionXml, org.candlepin.subscriptions.umb.CanonicalMessage.class)
+            .getPayload()
+            .getSync()
+            .getSubscription());
+  }
+
+  @Transactional
+  public void saveUmbSubscription(org.candlepin.subscriptions.umb.Subscription umbSubscription) {
+    org.candlepin.subscriptions.db.model.Subscription subscription = convertDto(umbSubscription);
+    syncSubscription(
+        subscription,
+        subscriptionRepository.findBySubscriptionNumber(subscription.getSubscriptionNumber()));
   }
 
   public void deleteSubscription(String subscriptionId) {
